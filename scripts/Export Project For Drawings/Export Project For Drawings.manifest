@@ -1,0 +1,10 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "script",
+    "author": "",
+    "description": {
+        "": "Exports the active design for the Fusion Drawing Generator: one STEP file per visible body, an .f3d archive and project_data.json."
+    },
+    "editEnabled": true,
+    "supportedOS": "windows|mac"
+}

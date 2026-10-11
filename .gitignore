@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.vscode/
+bin/
+build/
+dist/
+gui_error.log
+test_project/

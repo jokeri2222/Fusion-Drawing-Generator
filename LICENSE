@@ -1,0 +1,42 @@
+Fusion Drawing Generator License
+Copyright (c) 2026 jokeri2222. All rights reserved except as granted below.
+
+Permission is granted, free of charge, to any person obtaining a copy of this
+software and its source code ("the Software") to:
+
+1. Inspect and study the source code.
+2. Run the Software, as is, for any purpose, including commercial work.
+3. Modify the Software for your own use. You do not have to publish your
+   modifications.
+
+Conditions:
+
+A. Credit. If you publish, share or distribute the Software or any modified
+   version of it, in source or compiled form, you must give clear credit to the
+   original author (jokeri2222) and link to the original project, in the
+   program's About screen or documentation.
+
+B. Donations reserved. The right to ask for, collect or redirect donations,
+   sponsorship or payment for the Software is reserved to the original author
+   alone. You may not remove or replace the donation links, buttons or QR code
+   in the original Software, and you may not add your own donation or payment
+   requests to a published or distributed copy. Selling the Software, or a
+   modified version of it, is not permitted.
+
+C. This notice must be kept in all copies and substantial portions of the
+   Software.
+
+D. Contact. Any use not allowed above, and any request for permission,
+   collaboration or support, must go through GitHub: open an issue on this
+   repository or message the author at https://github.com/jokeri2222. The
+   author does not give out any other contact details.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM THE
+USE OF THE SOFTWARE.
+
+Third-party libraries (CadQuery, OpenCascade, VTK, PyQt5, ReportLab, SciPy and
+others) keep their own licenses; this license covers only the code in this
+repository.
