@@ -36,9 +36,9 @@ jobs:
         shell: bash
         run: |
           SEP=":"; [ "${{ matrix.target }}" = "windows" ] && SEP=";"
-          ICON=""; [ "${{ matrix.target }}" = "windows" ] && ICON="--icon assets/icon.ico"
-          WIN="--windowed"; [ "${{ matrix.target }}" = "mac" ] && WIN=""
+                    WIN="--windowed"; [ "${{ matrix.target }}" = "mac" ] && WIN=""
           HERE="$GITHUB_WORKSPACE"
+          ICON=""; [ "${{ matrix.target }}" = "windows" ] && ICON="--icon $HERE/assets/icon.ico"
           python -m PyInstaller --noconfirm --clean --onefile $WIN \
             --name FusionDrawingGenerator --distpath "$HERE/out" --workpath "$RUNNER_TEMP/work" --specpath "$RUNNER_TEMP/work" \
             --paths "$HERE/src" --add-data "$HERE/assets${SEP}assets" --add-data "$HERE/scripts${SEP}scripts" \
