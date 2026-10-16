@@ -522,14 +522,14 @@ def _finalize_hole_group(measurements, labels_by_segment, tol_fn=None):
         depth = seg['hi'] - seg['lo']
         label = labels_by_segment[i]
         is_diameter = label.startswith('Ø')
-        if tol_fn and is_diameter:
-            label = f'{label} ±{tol_fn(seg["diameter"]):.3f}'
+        if is_diameter:
+            label += tolerance_mod.tolerance_text(tol_fn, seg['diameter'], 'diameter')
         if is_diameter:
             label += ' mm'
         if is_last and is_thru:
             line = f'{label}  THRU ALL'
         else:
-            depth_text = f'{depth:.3f}' + (f' ±{tol_fn(depth):.3f}' if tol_fn else '') + ' mm'
+            depth_text = f'{depth:.3f}' + tolerance_mod.tolerance_text(tol_fn, depth, 'depth') + ' mm'
             line = f'{label}  {depth_text} DEEP'
 
         if len(measurements) > 1:
@@ -575,8 +575,7 @@ def _summarize_slots(slot_end_faces, bbox, tol_fn=None):
         anchor = rep.surface_midpoint
         estimated = max(1, round(len(faces) / 2))
         label = f'R{radius:.3f}'
-        if tol_fn:
-            label += f' ±{tol_fn(radius):.3f}'
+        label += tolerance_mod.tolerance_text(tol_fn, radius, 'slot')
         label += ' mm SLOT END' + (' TYP' if len(faces) > 1 else '')
         other_points = [f.surface_midpoint for f in faces[1:]]
         length_pairs = _pair_slot_ends(faces)
@@ -898,8 +897,7 @@ def _summarize_fillets_and_chamfers(step_body, tol_fn=None, extra_fillet_faces=(
     for (radius, view), faces in sorted(by_radius.items()):
         rep = faces[0]
         label = f'R{radius:.3f}'
-        if tol_fn:
-            label += f' ±{tol_fn(radius):.3f}'
+        label += tolerance_mod.tolerance_text(tol_fn, radius, 'fillet')
         label += ' mm' + (' TYP' if len(faces) > 1 else '')
         entries.append({
             'kind': 'fillet_summary',
@@ -926,8 +924,7 @@ def _summarize_fillets_and_chamfers(step_body, tol_fn=None, extra_fillet_faces=(
     for (angle, depth, view), faces in sorted(by_angle.items()):
         rep = faces[0]
         label = f'{depth:.3f}'
-        if tol_fn:
-            label += f' ±{tol_fn(depth):.3f}'
+        label += tolerance_mod.tolerance_text(tol_fn, depth, 'chamfer')
         label += f' mm x {angle:.1f}° CHAMFER' + (' TYP' if len(faces) > 1 else '')
         entries.append({
             'kind': 'chamfer_summary',

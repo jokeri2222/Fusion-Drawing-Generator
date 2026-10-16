@@ -35,6 +35,57 @@ PRESET_VALUES = {
     'standard': (0.2, 0.02, 0.5),
     'loose': (0.5, 0.05, 1.0),
 }
+# General tolerances for linear dimensions, ISO 2768-1 (+/- mm). A tolerance bigger than the chosen
+# standard allows for that size is left off the drawing. Size ranges: upper limit (mm) -> value.
+STANDARD_RANGES = (3, 6, 30, 120, 400, 1000, 2000, 4000)
+STANDARDS = {
+    'none': ('No limit', None),
+    'iso2768-f': ('ISO 2768-1 fine (f)', (0.05, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, None)),
+    'iso2768-m': ('ISO 2768-1 medium (m)', (0.1, 0.1, 0.2, 0.3, 0.5, 0.8, 1.2, 2.0)),
+    'iso2768-c': ('ISO 2768-1 coarse (c)', (0.2, 0.3, 0.5, 0.8, 1.2, 2.0, 3.0, 4.0)),
+    'iso2768-v': ('ISO 2768-1 very coarse (v)', (None, 0.5, 1.0, 1.5, 2.5, 4.0, 6.0, 8.0)),
+}
+DEFAULT_STANDARD = 'none'
+
+
+def standard_limit(standard, value_mm):
+    """Largest +/- (mm) the standard allows for a dimension of `value_mm`, or None for no limit."""
+    table = STANDARDS.get(standard, STANDARDS['none'])[1]
+    if not table:
+        return None
+    size = abs(value_mm)
+    for upper, limit in zip(STANDARD_RANGES, table):
+        if size <= upper:
+            return limit
+    return table[-1]
+
+
+# Kinds of feature/dimension a tolerance can be switched on or off for.
+KINDS = {
+    'span': 'Overall sizes and chain dimensions',
+    'diameter': 'Hole and bore diameters',
+    'depth': 'Hole depths',
+    'slot': 'Slot ends and slot lengths',
+    'fillet': 'Fillet radii',
+    'chamfer': 'Chamfer sizes',
+}
+DEFAULT_KINDS = {k: k not in ('fillet', 'chamfer') for k in KINDS}
+
+
+def tolerance_for(tol_fn, value_mm, kind):
+    """The +/- (mm) to print for a `kind` of dimension, or None when it is off or over the limit."""
+    if not tol_fn or not getattr(tol_fn, 'kinds', DEFAULT_KINDS).get(kind, True):
+        return None
+    return tol_fn(value_mm)
+
+
+def tolerance_text(tol_fn, value_mm, kind='span'):
+    """' ±0.020' for a callout, or '' when there is no tolerance for it (none wanted, over the
+    standard's limit, or a fillet/chamfer while those are switched off)."""
+    tol = tolerance_for(tol_fn, value_mm, kind)
+    return '' if tol is None else f' ±{tol:.3f}'
+
+
 TOLERANCE_PRESETS = {k: v[0] / 100.0 for k, v in PRESET_VALUES.items()}
 DEFAULT_PRESET = 'standard'
 PRESET_CHOICES = list(TOLERANCE_PRESETS) + ['custom']  # 'custom' uses ToleranceConfig.custom_percent
@@ -114,7 +165,7 @@ class ToleranceConfig:
 
     def __init__(self, preset=DEFAULT_PRESET, manufacturing_temp_c=20.0, operating_min_c=20.0, operating_max_c=20.0,
                  body_overrides=None, custom_min_mm=0.02, custom_max_mm=0.5,
-                 body_gaps=None, custom_percent=0.2, **_ignored):
+                 body_gaps=None, custom_percent=0.2, kinds=None, max_standard=DEFAULT_STANDARD, **_ignored):
         self.preset = preset if preset in PRESET_CHOICES else DEFAULT_PRESET
         self.manufacturing_temp_c = manufacturing_temp_c
         self.operating_min_c = operating_min_c
@@ -124,6 +175,8 @@ class ToleranceConfig:
         self.custom_max_mm = max(custom_max_mm, custom_min_mm)
         self.body_gaps = body_gaps if body_gaps is not None else {}
         self.custom_percent = custom_percent  # % of the dimension, used when preset == 'custom'
+        self.kinds = {k: bool((kinds or {}).get(k, DEFAULT_KINDS[k])) for k in KINDS}   # which kinds get a +/-
+        self.max_standard = max_standard if max_standard in STANDARDS else DEFAULT_STANDARD
         self.fit_mm = None  # set by for_body()
 
     def _values(self):
@@ -162,6 +215,7 @@ class ToleranceConfig:
             body_overrides=self.body_overrides,
             custom_min_mm=self.custom_min_mm, custom_max_mm=self.custom_max_mm,
             body_gaps=self.body_gaps, custom_percent=self.custom_percent,
+            kinds=self.kinds, max_standard=self.max_standard,
         )
         cfg.fit_mm = cfg.fit_band_mm(self.body_gaps.get(body_name))
         return cfg
@@ -182,6 +236,8 @@ class ToleranceConfig:
             'operating_max_c': self.operating_max_c,
             'custom_min_mm': self.custom_min_mm,
             'custom_max_mm': self.custom_max_mm,
+            'kinds': self.kinds,
+            'max_standard': self.max_standard,
         }
         if self.body_overrides:
             d['body_overrides'] = self.body_overrides
@@ -200,6 +256,8 @@ class ToleranceConfig:
             body_overrides=d.get('body_overrides', {}),
             custom_min_mm=d.get('custom_min_mm', d.get('min_tolerance_mm', 0.02)),
             custom_max_mm=d.get('custom_max_mm', d.get('max_tolerance_mm', 0.5)),
+            kinds=d.get('kinds'),
+            max_standard=d.get('max_standard', DEFAULT_STANDARD),
         )
 
 
@@ -259,7 +317,12 @@ def make_tolerance_fn(material_entry, config):
     generator actually threads through its dimension/callout text builders.
     """
     def fn(value_mm):
-        return compute_tolerance(value_mm, material_entry, config)
+        tol = compute_tolerance(value_mm, material_entry, config)
+        limit = standard_limit(config.max_standard, value_mm)
+        if tol is not None and limit is not None and tol > limit:
+            return None   # looser than the standard allows: no tolerance on this feature
+        return tol
+    fn.kinds = config.kinds
     return fn
 
 
