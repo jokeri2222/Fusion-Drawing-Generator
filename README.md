@@ -13,7 +13,8 @@ The files are not code-signed, so Windows SmartScreen or macOS Gatekeeper may wa
 1. In Fusion 360, add the script from the `scripts/Export Project For Drawings` folder (Utilities > Add-Ins > Scripts > green plus) and run it on your design. It writes an `exports` folder with `project_data.json` and one STEP file per body.
 2. Start the program and pick the folder that contains `exports`.
 3. Choose which bodies get a drawing, are assembly-only, or are ignored (Project menu).
-4. Adjust drawing settings, units and theme (Settings and Themes menus), then generate drawings or assembly instructions.
+4. Adjust drawing settings, units and theme (Settings and Themes menus). In the tolerance section you can switch tolerances on or off per kind of dimension (fillets and chamfers are off by default) and leave off any tolerance looser than an ISO 2768 class.
+5. Generate drawings or assembly instructions. Generation uses several processor cores and remembers the part-to-part gap measurements, so repeat runs are much faster.
 
 The Help menu inside the program explains every option, and the Fusion Script menu shows where the export script lives.
 
@@ -27,6 +28,8 @@ python main.py
 ```
 
 `setup.py` installs the dependencies and creates a desktop shortcut (`--no-shortcut` skips it).
+
+See the [changelog](CHANGELOG.md) for what changed in each version.
 
 ## Building the binaries
 
