@@ -396,6 +396,26 @@ class MainWindow(QtWidgets.QMainWindow):
         line.setObjectName('divider')
         line.setFixedHeight(1)
         lay.addWidget(line)
+        limits = QtWidgets.QHBoxLayout()
+        self.kind_boxes = {}
+        kinds = QtWidgets.QHBoxLayout()
+        kinds.addWidget(QtWidgets.QLabel('Print a ± on:'))
+        for key, title in tolerance_mod.KINDS.items():
+            box = QtWidgets.QCheckBox(title)
+            box.setChecked(tolerance_mod.DEFAULT_KINDS[key])
+            self.kind_boxes[key] = box
+            kinds.addWidget(box)
+        kinds.addStretch(1)
+        lay.addLayout(kinds)
+        limits.addWidget(QtWidgets.QLabel('Leave the tolerance off when it is looser than'))
+        self.max_standard = QtWidgets.QComboBox()
+        for key, (title, _table) in tolerance_mod.STANDARDS.items():
+            self.max_standard.addItem(title, key)
+        self.max_standard.setToolTip('A feature whose calculated ± is bigger than this standard allows for its size '
+                                     'gets no tolerance figure at all.')
+        limits.addWidget(self.max_standard)
+        limits.addStretch(1)
+        lay.addLayout(limits)
         temps = QtWidgets.QHBoxLayout()
         for text, spin in (('Manufacturing temperature', self.mfg_temp), ('Operating minimum', self.op_min),
                            ('Operating maximum', self.op_max)):
@@ -414,7 +434,8 @@ class MainWindow(QtWidgets.QMainWindow):
             'between the smallest tolerance and the fit band: half the gap to the nearest part, or the largest '
             'tolerance when none is close) with thermal movement from the part\'s material. Equal temperatures give '
             'no thermal movement; the machining margin still applies. Drawings only carry tolerances once settings '
-            'have been saved for the project.'))
+            'have been saved for the project. Fillets and chamfers carry no ± unless their box is ticked, and a ± '
+            'larger than the chosen ISO 2768 class allows for that size is left off.'))
         self._apply_unit_labels()
         self._set_len(self.min_tol, 0.02)
         self._set_len(self.max_tol, 0.5)
@@ -733,6 +754,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_len(self.min_tol, float(cfg.custom_min_mm))
         self._set_len(self.max_tol, float(cfg.custom_max_mm))
         self._select_preset(cfg.preset)
+        for key, box in self.kind_boxes.items():
+            box.setChecked(cfg.kinds[key])
+        self.max_standard.setCurrentIndex(max(self.max_standard.findData(cfg.max_standard), 0))
         self.body_overrides = dict(cfg.body_overrides)
         self._update_override_summary()
 
@@ -750,7 +774,8 @@ class MainWindow(QtWidgets.QMainWindow):
             preset=self._preset(), custom_percent=self.custom_pct.value(),
             manufacturing_temp_c=self.mfg_temp._base, operating_min_c=self.op_min._base,
             operating_max_c=self.op_max._base, custom_min_mm=self.min_tol._base,
-            custom_max_mm=self.max_tol._base, body_overrides=self.body_overrides)
+            custom_max_mm=self.max_tol._base, body_overrides=self.body_overrides,
+            kinds={k: b.isChecked() for k, b in self.kind_boxes.items()}, max_standard=self.max_standard.currentData())
 
     def _require_project(self, need_data=True):
         project = self._resolved_project_dir()

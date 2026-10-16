@@ -42,6 +42,7 @@ from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from reportlab.lib.pagesizes import A3, landscape
 from reportlab.lib.units import mm
 
+import tolerance as tolerance_mod
 import units
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase.pdfmetrics import stringWidth
@@ -347,6 +348,19 @@ def _draw_arrowhead(c, tip_x, tip_y, angle_deg):
     c.drawPath(path, fill=1, stroke=0)
 
 
+def _draw_terminators(c, x1, y1, x2, y2, angle_deg):
+    """The two ends of a dimension line: arrowheads, or - when the line is too short to hold two
+    arrowheads - small dots, so a run of tiny neighbouring dimensions reads as a clean row of
+    points instead of one solid black blob."""
+    if math.hypot(x2 - x1, y2 - y1) < 2 * ARROW_LENGTH + 1.0:
+        c.setFillColorRGB(0, 0, 0)
+        c.circle(x1, y1, 0.55, stroke=0, fill=1)
+        c.circle(x2, y2, 0.55, stroke=0, fill=1)
+        return
+    _draw_arrowhead(c, x1, y1, angle_deg + 180)
+    _draw_arrowhead(c, x2, y2, angle_deg)
+
+
 def _draw_extension_line_vertical(c, x, object_y, dim_y):
     """A vertical extension line at page-x `x`, running from just short of
     the object point (small gap, so it doesn't touch the geometry) to just
@@ -425,8 +439,7 @@ def _draw_dimension_line(c, x1, y1, x2, y2, text, orientation, ext_from1=None, e
         _draw_extension_line_vertical(c, x2, f2[1], y2)
 
         c.line(x1, y1, x2, y2)
-        _draw_arrowhead(c, x1, y1, 180)
-        _draw_arrowhead(c, x2, y2, 0)
+        _draw_terminators(c, x1, y1, x2, y2, 0)
 
         c.setFont('Helvetica', DIM_TEXT_FONT_SIZE)
         c.setFillColorRGB(0, 0, 0)
@@ -438,8 +451,7 @@ def _draw_dimension_line(c, x1, y1, x2, y2, text, orientation, ext_from1=None, e
         _draw_extension_line_horizontal(c, y2, f2[0], x2)
 
         c.line(x1, y1, x2, y2)
-        _draw_arrowhead(c, x1, y1, 270)
-        _draw_arrowhead(c, x2, y2, 90)
+        _draw_terminators(c, x1, y1, x2, y2, 90)
 
         c.setFont('Helvetica', DIM_TEXT_FONT_SIZE)
         c.setFillColorRGB(0, 0, 0)
@@ -746,106 +758,293 @@ CHAIN_LEADER_LENGTH = 14.0   # points - from the dimension line to a moved-out l
 CHAIN_LEADER_STEP = 9.0      # points - shift per extra moved-out label that would collide
 
 
+CHAIN_LABEL_SPACING = 3.0    # points - clear margin kept between moved-out labels
+CHAIN_REACH_STEPS = 10       # how many pointer lengths are tried
+CHAIN_SHIFT_STEPS = 31       # sideways positions tried per pointer length
 CHAIN_LABEL_GAP = 9.0        # points - clearance between a moved-out label and the line end
 
 
-def _draw_chain_label_outside(c, px1, py1, px2, py2, row_pos, text, text_w, orientation,
-                              occupied, avoid_segments=(), leads=None):
-    """Draw one chain dimension whose text can't fit beside its segment: the
-    dimension line and arrows as usual, the text on a straight pointer from
-    the middle of the dimension. Candidates span both sides of the row, four
-    pointer lengths and sideways shifts, so neighbouring labels fan out in
-    steps. Rejected: overlapping another label in `occupied`, a pointer
-    running through a label or crossing another pointer in `leads`, or
-    leaving the frame; of the rest, the one crossing the fewest lines wins
-    (ties go to the nearest). The chosen box and pointer are recorded."""
-    leads = [] if leads is None else leads
-    height = DIM_TEXT_FONT_SIZE * 1.1
+def _spread_in_order(targets, pitch):
+    """Positions as close as possible (least squares) to `targets`, in the same order, at least
+    `pitch` apart - so a crowd of labels fans out evenly around where they belong without ever
+    overlapping or swapping places (pool-adjacent-violators on the gaps)."""
+    n = len(targets)
+    adjusted = [t - i * pitch for i, t in enumerate(targets)]
+    blocks = []   # [sum, count]
+    for value in adjusted:
+        blocks.append([value, 1])
+        while len(blocks) > 1 and blocks[-2][0] / blocks[-2][1] > blocks[-1][0] / blocks[-1][1]:
+            total, count = blocks.pop()
+            blocks[-1][0] += total
+            blocks[-1][1] += count
+    out = []
+    for total, count in blocks:
+        out.extend([total / count] * count)
+    return [out[i] + i * pitch for i in range(n)]
+
+
+CHAIN_DIM_STEP = 7.0          # points - each tiny dimension line sits this much further in than the last
+CHAIN_LABEL_STEP = 10.0       # points - and its text this much further in than the last one's
+CHAIN_STAIR_MAX = 60.0        # points - a run's staircase is squeezed to fit within this depth
+CHAIN_LABEL_MARGIN = 16.0     # points - clear space between the deepest dimension line and the texts
+CHAIN_MODEL_MARGIN = 10.0     # points - labels stay at least this far from the model itself
+CHAIN_DODGE_RANGE = 40        # a label may slide this many steps either way to clear lines
+CHAIN_LINE_CLEARANCE = 2.0    # points of clear space kept between a label and any line
+CHAIN_DODGE_STEP = 3.0        # points per step of that slide
+CHAIN_PUSH_STEP = 4.0         # points - a column of labels is pushed out from its row in steps of this
+CHAIN_PUSH_TRIES = 20         # and at most this many steps
+
+
+def _draw_tiny_chain_dimensions(c, tiny, row_pos, orientation, occupied, avoid_segments, deferred,
+                                chain_center=None):
+    """Dimensions too short for their own text, laid out together as a staircase.
+
+    Each dimension line sits on its own sideways step (so neighbouring ends never share a spot and
+    the arrows/dots stay apart), and each label sits on a pointer from the middle of its line.
+    Labels keep the order of their dimensions: along a vertical chain they are spread evenly
+    down a column (never overlapping or crossing), along a horizontal chain they are stacked on
+    tiers. The text is stepped sideways too, so the column reads as a staircase."""
+    if not tiny:
+        return
     vertical = orientation == 'vertical'
-    if vertical:
-        _draw_dimension_line(c, row_pos, py1, row_pos, py2, '', 'vertical',
-                             ext_from1=(px1, py1), ext_from2=(px2, py2))
-        lo, hi = min(py1, py2), max(py1, py2)
-    else:
-        _draw_dimension_line(c, px1, row_pos, px2, row_pos, '', 'horizontal',
-                             ext_from1=(px1, py1), ext_from2=(px2, py2))
-        lo, hi = min(px1, px2), max(px1, px2)
-    mid = (lo + hi) / 2
+    height = DIM_TEXT_FONT_SIZE * 1.1
+    gap = CHAIN_LABEL_SPACING
 
-    def box_for(center, offset):
+    def page(u, v):
+        return (v, u) if vertical else (u, v)
+
+    # Neighbouring dimensions too short even for two arrowheads (they are drawn as dots, which would
+    # merge into one blob on a shared row) form a staircase: every line sits a step further into
+    # the model than the one before it, and its text a step further again. Dimensions long enough
+    # to show their arrows stay on the row - no stair. A staircase deepens toward the OUTER end of
+    # the chain's middle, so one near the bottom mirrors one near the top.
+    for item in tiny:
+        item['u_mid'] = (item['lo'] + item['hi']) / 2
+        item['short'] = (item['hi'] - item['lo']) < 2 * ARROW_LENGTH + 1.0
+    run, previous = -1, None
+    for item in tiny:
+        if previous is None or item['index'] != previous + 1:
+            run += 1
+        item['run'] = run
+        previous = item['index']
+    members = {}
+    for item in tiny:
+        members.setdefault(item['run'], []).append(item)
+    centre = chain_center if chain_center is not None else sum(i['u_mid'] for i in tiny) / len(tiny)
+    group_sizes = {}
+    for group in members.values():
+        group.sort(key=lambda i: i['u_mid'])
+        if sum(i['u_mid'] for i in group) / len(group) >= centre:
+            group.reverse()              # deepest step toward the middle of the chain, so pointers never cross
+        stair, count, previous_short = 0, 0, False
+        for item in group:
+            if item['short']:
+                if not previous_short:
+                    stair += 1
+                    count = 0
+                item['k'], item['stair'] = count, (item['run'], stair)
+                count += 1
+            else:
+                item['k'], item['stair'] = 0, (item['run'], -id(item))      # its own, un-stepped
+            previous_short = item['short']
+    for item in tiny:
+        group_sizes[item['stair']] = group_sizes.get(item['stair'], 0) + 1
+    run_sizes = group_sizes
+
+    # The staircase always steps into the model: toward the side the measured points are on, and
+    # never closer to the model than CHAIN_MODEL_MARGIN.
+    toward = [(item['p1'][0] + item['p2'][0]) / 2 if vertical else (item['p1'][1] + item['p2'][1]) / 2
+              for item in tiny]
+    mean_toward = sum(toward) / len(toward)
+    side = -1 if mean_toward <= row_pos else 1
+    widest = max(item['w'] for item in tiny)
+    room = abs(row_pos - mean_toward) - (widest if vertical else height) - CHAIN_MODEL_MARGIN
+    budget = max(room - CHAIN_LABEL_MARGIN, 12.0)      # what the staircase itself may use
+
+    def steps(item):
+        n = run_sizes[item['stair']]
+        squeeze = min(1.0, CHAIN_STAIR_MAX / (max(n - 1, 1) * (CHAIN_DIM_STEP + CHAIN_LABEL_STEP)),
+                      budget / (max(n - 1, 1) * (CHAIN_DIM_STEP + CHAIN_LABEL_STEP)))
+        return CHAIN_DIM_STEP * squeeze, CHAIN_LABEL_STEP * squeeze
+
+    def depth(item):
+        return steps(item)[0] * (run_sizes[item['stair']] - 1)
+
+    for item in tiny:
+        item['v'] = row_pos + side * steps(item)[0] * item['k']          # the staircase of dimension lines
+
+    # Everything a label should keep clear of: the geometry, other dimension lines, and the
+    # extension lines of these very dimensions.
+    obstacles = list(avoid_segments) if isinstance(avoid_segments, list) else []
+    for item in tiny:
+        for point in (item['p1'], item['p2']):
+            obstacles.append((point[0], point[1], item['v'], point[1]) if vertical
+                             else (point[0], point[1], point[0], item['v']))
+    grid = _SegmentGrid(obstacles)
+    pitch = height + gap
+    page_lo, page_hi = (MARGIN, PAGE_SIZE[0] - MARGIN) if vertical else (MARGIN, PAGE_SIZE[1] - MARGIN)
+    u_lo, u_hi = (MARGIN + height / 2, PAGE_SIZE[1] - MARGIN - height / 2) if vertical else (None, None)
+
+    # position of each label along the chain before any sliding, and (horizontal) its tier
+    if vertical:
+        order = sorted(range(len(tiny)), key=lambda k: tiny[k]['u_mid'])
+        slots = _spread_in_order([tiny[k]['u_mid'] for k in order], pitch)
+        shift = max(0.0, u_lo - slots[0]) - max(0.0, slots[-1] - u_hi)
+        slots = [pos + shift for pos in slots]
+        for k, pos in zip(order, slots):
+            tiny[k]['u_label'] = pos
+    else:
+        placed = []   # (row, lo, hi)
+        for k in sorted(range(len(tiny)), key=lambda k: tiny[k]['u_mid']):
+            item = tiny[k]
+            lo, hi = item['u_mid'] - item['w'] / 2, item['u_mid'] + item['w'] / 2
+            row = 0
+            while any(r == row and lo < h + gap and l < hi + gap for r, l, h in placed):
+                row += 1
+            placed.append((row, lo, hi))
+            item['row'] = row
+            item['u_label'] = item['u_mid']
+
+    pushed = {'out': 0.0}     # how far the whole column of labels has been pushed out from the row
+
+    def label_edge(item, lside):
+        """Where the label's near edge sits across the row: beyond the staircase when the label is
+        on the model's side of the row, otherwise just clear of the row on the far side."""
+        reach = CHAIN_LABEL_MARGIN + pushed['out'] + (steps(item)[1] * item['k'] if vertical else item['row'] * pitch)
+        if lside == side:
+            reach += depth(item)
+        return row_pos + lside * reach
+
+    def box_at(item, u, lside):
+        edge = label_edge(item, lside)
         if vertical:
-            return _dimension_text_box(c, row_pos, center, row_pos, center, text, 'vertical', offset)
-        return _dimension_text_box(c, center, row_pos, center, row_pos, text, 'horizontal', offset)
+            x0, x1 = (edge - item['w'], edge) if lside < 0 else (edge, edge + item['w'])
+            return (x0, u - height / 2, x1, u + height / 2)
+        y0, y1 = (edge, edge + height) if lside > 0 else (edge - height, edge)
+        return (u - item['w'] / 2, y0, u + item['w'] / 2, y1)
 
-    # Candidates: the text on a straight pointer from the middle of its own
-    # dimension, on either side of the row, at stepped distances and sideways
-    # shifts (so neighbours fan out in stairs rather than sitting in line).
-    candidates = []     # (box, lead)
-    for length_step in range(4):
-        reach = CHAIN_LEADER_LENGTH + length_step * CHAIN_LEADER_STEP
-        for shift_step in range(7):
-            shift = ((shift_step + 1) // 2) * CHAIN_LEADER_STEP * (1 if shift_step % 2 else -1)
-            for sign in (-1, 1):
-                center = mid + shift
-                if vertical:
-                    x_edge = row_pos + sign * reach
-                    box = (x_edge - text_w, center - height / 2, x_edge, center + height / 2) if sign < 0 else                           (x_edge, center - height / 2, x_edge + text_w, center + height / 2)
-                    lead = (row_pos, mid, x_edge, center)
-                else:
-                    y0 = row_pos + sign * reach
-                    box = (center - text_w / 2, y0, center + text_w / 2, y0 + height) if sign > 0 else                           (center - text_w / 2, y0 - height, center + text_w / 2, y0)
-                    lead = (mid, row_pos, center, y0 if sign < 0 else y0)
-                    lead = (mid, row_pos, center, box[1] if sign > 0 else box[3])
-                candidates.append((box, lead))
+    def crossings(item, u, lside):
+        box = box_at(item, u, lside)
+        return _count_segment_intersections(box, grid.near(box, margin=CHAIN_LINE_CLEARANCE),
+                                            margin=CHAIN_LINE_CLEARANCE)
 
-    def lead_hits_box(lead, other):
-        x1, y1, x2, y2 = lead
-        return any(other[0] - 1 <= x1 + (x2 - x1) * t / 20 <= other[2] + 1
-                   and other[1] - 1 <= y1 + (y2 - y1) * t / 20 <= other[3] + 1
-                   for t in range(21))
+    # The texts go on whichever side of the row has the fewer lines (and stays on the sheet) -
+    # the model's side, or the far side, away from the model - and the whole column is pushed
+    # out from the row, a step at a time, until it clears the lines (or stops improving).
+    def side_cost(lside, out):
+        pushed['out'] = out
+        total = 0.0
+        for item in tiny:
+            box = box_at(item, item['u_label'], lside)
+            lo_edge, hi_edge = (box[0], box[2]) if vertical else (box[1], box[3])
+            if lo_edge < page_lo or hi_edge > page_hi:
+                total += 1000.0
+            total += 10.0 * crossings(item, item['u_label'], lside)
+        return total + 0.02 * out
 
-    def leads_cross(l1, l2):
-        def side(a, b, p):
-            return (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
-        a1, a2, b1, b2 = l1[:2], l1[2:], l2[:2], l2[2:]
-        return side(a1, a2, b1) * side(a1, a2, b2) < 0 and side(b1, b2, a1) * side(b1, b2, a2) < 0
+    options = []
+    for lside_try in (-side, side):
+        tries = range(0, CHAIN_PUSH_TRIES) if not vertical else range(1)
+        costs = [(side_cost(lside_try, n * CHAIN_PUSH_STEP), n * CHAIN_PUSH_STEP) for n in tries]
+        options.append((min(costs), lside_try))
+    (_best_cost, best_push), lside = min(options, key=lambda option: (option[0][0], option[1] != -side))
+    pushed['out'] = best_push
 
-    best, best_score = None, None
-    for index, (box, lead) in enumerate(candidates):
-        if any(_boxes_overlap(box, o, margin=1.0) for o in occupied):
-            continue
-        if box[2] > PAGE_SIZE[0] - MARGIN or box[0] < MARGIN:
-            continue                       # would leave the drawing frame
-        if any(lead_hits_box(lead, o) for o in occupied):
-            continue                       # pointer would run through another label
-        if any(leads_cross(lead, other) for other in leads):
-            continue
-        crossings = _count_segment_intersections(box, list(avoid_segments), margin=1.0)
-        score = (crossings, index)
-        if best_score is None or score < best_score:
-            best, best_score = (box, lead), score
-    if best is None:                       # nothing free: fall back to the first spot
-        best = candidates[0]
-    box, lead = best
-    occupied.append(box)
-    leads.append(lead)
-
-    c.saveState()
-    c.setLineWidth(0.3)
-    c.setFont('Helvetica', DIM_TEXT_FONT_SIZE)
-    c.line(*lead)
-    c.setFillColorRGB(0, 0, 0)
-    c.circle(lead[0], lead[1], 0.8, stroke=0, fill=1)
-    c.setFillColorRGB(1, 1, 1)
-    c.rect(box[0] - 0.5, box[1], box[2] - box[0] + 1, box[3] - box[1], stroke=0, fill=1)
-    c.setFillColorRGB(0, 0, 0)
     if vertical:
-        (c.drawRightString if box[2] <= row_pos else c.drawString)(
-            box[2] if box[2] <= row_pos else box[0], (box[1] + box[3]) / 2 - DIM_TEXT_FONT_SIZE * 0.35, text)
-    else:
-        c.drawCentredString((box[0] + box[2]) / 2, box[1] + 1.5, text)
-    c.restoreState()
-    return box
+        candidates = []
+        for k, target in zip(order, slots):
+            options = []
+            for j in range(-CHAIN_DODGE_RANGE, CHAIN_DODGE_RANGE + 1):
+                u = target + j * CHAIN_DODGE_STEP
+                if u_lo <= u <= u_hi:
+                    options.append((u, 10.0 * crossings(tiny[k], u, lside) + 0.03 * abs(u - target)))
+            candidates.append(options or [(target, 0.0)])
+        # Slide each label (keeping the order and spacing) to where it crosses the fewest lines.
+        best = [[cost for _u, cost in candidates[0]]]
+        back = [[None] * len(candidates[0])]
+        for i in range(1, len(candidates)):
+            row_cost, row_back = [], []
+            for u, cost in candidates[i]:
+                choice, choice_cost = None, None
+                for q, (u_prev, _c) in enumerate(candidates[i - 1]):
+                    if u - u_prev >= pitch - 1e-6 and (choice_cost is None or best[i - 1][q] < choice_cost):
+                        choice, choice_cost = q, best[i - 1][q]
+                row_cost.append(cost + choice_cost if choice is not None else 1e9)
+                row_back.append(choice)
+            best.append(row_cost)
+            back.append(row_back)
+        pick = min(range(len(best[-1])), key=lambda q: best[-1][q])
+        chosen = [None] * len(candidates)
+        for i in range(len(candidates) - 1, -1, -1):
+            chosen[i] = candidates[i][pick][0]
+            pick = back[i][pick] if back[i][pick] is not None else 0
+        for k, u in zip(order, chosen):
+            tiny[k]['u_label'] = u
+
+    # Crowded dimensions on a staircase get right-angled pointers: each runs along its own step of
+    # the staircase, then straight across to its label, so the pointers are separate parallel lines
+    # rather than a fan of near-identical diagonals. Nesting them without crossings means the
+    # pointer with the longest run takes the step closest to the row, the shortest the deepest.
+    if vertical and lside == side:
+        groups = {}
+        for item in tiny:
+            if item['short']:
+                groups.setdefault(item['stair'], []).append(item)
+        for group in groups.values():
+            if len(group) > 1:
+                ordered = sorted(group, key=lambda i: -abs(i['u_label'] - i['u_mid']))
+                for k, item in enumerate(ordered):
+                    item['k'] = k
+                    item['v'] = row_pos + side * steps(item)[0] * k
+                    item['ortho'] = True
+
+    for item in tiny:
+        v_line = item['v']
+        (x1, y1), (x2, y2) = page(item['lo'], v_line), page(item['hi'], v_line)
+        _draw_dimension_line(c, x1, y1, x2, y2, '', orientation,
+                             ext_from1=item['p1'], ext_from2=item['p2'])
+        box = box_at(item, item['u_label'], lside)
+        edge = label_edge(item, lside)
+        if vertical and item.get('ortho'):
+            lead = [(v_line, item['u_mid']), (v_line, item['u_label']), (edge, item['u_label'])]
+        elif vertical:
+            lead = [(v_line, item['u_mid']), (edge, item['u_label'])]
+        else:
+            lead = [(item['u_mid'], v_line), (item['u_label'], box[1] if lside > 0 else box[3])]
+        occupied.append(box)
+        if isinstance(avoid_segments, list):
+            avoid_segments.append((x1, y1, x2, y2))
+            for first, second in zip(lead, lead[1:]):
+                avoid_segments.append(first + second)
+        deferred.append(_chain_label_painter(c, box, lead, item['text'], vertical, row_pos))
+
+
+def _chain_label_painter(c, box, lead, text, vertical, row_pos):
+    def paint():
+        c.saveState()
+        c.setLineWidth(0.3)
+        c.setFont('Helvetica', DIM_TEXT_FONT_SIZE)
+        path = c.beginPath()
+        path.moveTo(*lead[0])
+        for point in lead[1:]:
+            path.lineTo(*point)
+        c.drawPath(path, stroke=1, fill=0)
+        c.setFillColorRGB(0, 0, 0)
+        c.circle(lead[0][0], lead[0][1], 0.8, stroke=0, fill=1)
+        c.setFillColorRGB(1, 1, 1)
+        c.rect(box[0] - 1.0, box[1] - 0.5, box[2] - box[0] + 2.0, box[3] - box[1] + 1.0, stroke=0, fill=1)
+        c.setFillColorRGB(0, 0, 0)
+        if vertical:
+            (c.drawRightString if box[2] <= row_pos else c.drawString)(
+                box[2] if box[2] <= row_pos else box[0], (box[1] + box[3]) / 2 - DIM_TEXT_FONT_SIZE * 0.35, text)
+        else:
+            c.drawCentredString((box[0] + box[2]) / 2, box[1] + 1.5, text)
+        c.restoreState()
+    return paint
+
+
+# Moved-out chain labels, painted once the whole view is drawn so nothing lands on top of them.
+_LATE_PAINTS = []
 
 
 def _draw_chain_dimensions(c, ordered_points, row_pos, orientation, tol_fn=None, avoid_segments=()):
@@ -875,21 +1074,21 @@ def _draw_chain_dimensions(c, ordered_points, row_pos, orientation, tol_fn=None,
     leads = []          # their pointer lines
     slots = {}          # (side, tier) -> page-position where that slot's last label ends
     text_boxes = []
-    for (model1, px1, py1), (model2, px2, py2) in zip(ordered_points, ordered_points[1:]):
+    deferred = []       # moved-out labels, painted last
+    tiny = []           # dimensions too short for their own text
+    register = avoid_segments.append if isinstance(avoid_segments, list) else (lambda _seg: None)
+    for seg_index, ((model1, px1, py1), (model2, px2, py2)) in enumerate(zip(ordered_points, ordered_points[1:])):
         span = abs(model2 - model1)
-        text = units.format_dimension(span, tol_fn(span) if tol_fn else None)
+        text = units.format_dimension(span, tolerance_mod.tolerance_for(tol_fn, span, 'span'))
         text_w = stringWidth(text, 'Helvetica', 6.5)
         center = (px1 + px2) / 2 if orientation == 'horizontal' else (py1 + py2) / 2
         start, end = center - text_w / 2, center + text_w / 2
 
         seg_len = abs(py2 - py1) if orientation == 'vertical' else abs(px2 - px1)
         if text_w + 2 * ARROW_LENGTH > seg_len:
-            # Doesn't fit beside its own segment: draw the dimension without
-            # text and put the text clear of the line on a leader instead.
-            text_boxes.append(_draw_chain_label_outside(
-                c, px1, py1, px2, py2, row_pos, text, text_w, orientation,
-                outside_boxes + text_boxes, avoid_segments, leads))
-            outside_boxes.append(text_boxes[-1])
+            # Doesn't fit beside its own segment: collected, then laid out together as a staircase.
+            lo, hi = (min(py1, py2), max(py1, py2)) if orientation == 'vertical' else (min(px1, px2), max(px1, px2))
+            tiny.append({'index': seg_index, 'text': text, 'w': text_w, 'lo': lo, 'hi': hi, 'p1': (px1, py1), 'p2': (px2, py2)})
             continue
 
         tier = 0
@@ -904,6 +1103,7 @@ def _draw_chain_dimensions(c, ordered_points, row_pos, orientation, tol_fn=None,
         slots[(side, tier)] = end
         offset = -CHAIN_TEXT_STAGGER * tier if side == 0 else flip_offset + CHAIN_TEXT_STAGGER * tier
 
+        register((px1, row_pos, px2, row_pos) if orientation == 'horizontal' else (row_pos, py1, row_pos, py2))
         if orientation == 'horizontal':
             _draw_dimension_line(
                 c, px1, row_pos, px2, row_pos, text, 'horizontal',
@@ -916,6 +1116,10 @@ def _draw_chain_dimensions(c, ordered_points, row_pos, orientation, tol_fn=None,
                 ext_from1=(px1, py1), ext_from2=(px2, py2), text_offset=offset,
             )
             text_boxes.append(_dimension_text_box(c, row_pos, py1, row_pos, py2, text, 'vertical', offset))
+    along = [pt[2] if orientation == 'vertical' else pt[1] for pt in ordered_points]
+    _draw_tiny_chain_dimensions(c, tiny, row_pos, orientation, outside_boxes + text_boxes,
+                                avoid_segments, deferred, chain_center=(min(along) + max(along)) / 2)
+    _LATE_PAINTS.extend(deferred)
     return text_boxes
 
 
@@ -1639,8 +1843,11 @@ def _draw_view(c, view, origin_x, origin_y, box_w, box_h, label, callouts=None,
         def _rss_or_flat_tolerance(full_span, ordered_pts, coord_index):
             if ordered_pts and len(ordered_pts) > 1:
                 segments = [abs(b[coord_index] - a[coord_index]) for a, b in zip(ordered_pts, ordered_pts[1:])]
-                return math.sqrt(sum(tol_fn(seg) ** 2 for seg in segments))
-            return tol_fn(full_span)
+                parts = [tolerance_mod.tolerance_for(tol_fn, seg, 'span') for seg in segments]
+                if any(t is None for t in parts):
+                    return None   # a gap in the chain is over the standard's limit
+                return math.sqrt(sum(t ** 2 for t in parts))
+            return tolerance_mod.tolerance_for(tol_fn, full_span, 'span')
 
         dim_y = origin_y + padding * ENVELOPE_ROW_FRACTION
         dim_x = origin_x + box_w - padding * ENVELOPE_ROW_FRACTION
@@ -1828,7 +2035,7 @@ def _draw_view(c, view, origin_x, origin_y, box_w, box_h, label, callouts=None,
         for (p1x, p1y), (p2x, p2y), length_mm in length_dims:
             a = to_page((p1x, p1y))
             b = to_page((p2x, p2y))
-            text = units.format_dimension(length_mm, tol_fn(length_mm) if tol_fn else None)
+            text = units.format_dimension(length_mm, tolerance_mod.tolerance_for(tol_fn, length_mm, 'slot'))
             result = _draw_offset_dimension(c, a, b, text, view_bbox_min, view_bbox_max,
                                              avoid_segments, MIN_DIMENSION_CLEARANCE)
             if result:
@@ -1837,6 +2044,9 @@ def _draw_view(c, view, origin_x, origin_y, box_w, box_h, label, callouts=None,
                 avoid_segments.append((ax1, ay1, ax2, ay2))
                 avoid_segments.append((bx1, by1, bx2, by2))
 
+    for paint in _LATE_PAINTS:
+        paint()
+    del _LATE_PAINTS[:]
     c.rect(origin_x, origin_y, box_w, box_h, stroke=1, fill=0)
     c.setFont('Helvetica-Bold', 9)
     c.drawString(origin_x + 3, origin_y + box_h - 12, label)
@@ -2316,7 +2526,7 @@ def generate_drawing(step_path, matches, output_pdf_path, tol_fn=None, feature_s
             # the matched features' own numbers
             number = diameter_number.setdefault(round(dia, 3), len(feature_number) + len(diameter_number) + 1)
             callouts.append((cx, cy, _format_balloon_label([number]), _r, True))
-            legend[str(number)] = ['Ø' + units.format_dimension(dia, tol_fn(dia) if tol_fn else None) + ' DIAMETER']
+            legend[str(number)] = ['Ø' + units.format_dimension(dia, tolerance_mod.tolerance_for(tol_fn, dia, 'diameter')) + ' DIAMETER']
         pages.append((view_key, view_key, callouts, length_dims, legend, cross_marks, True, True,
                       (xs_chain, ys_chain)))
     pages.append(('ISO', 'ISO (pictorial)', None, None, {}, None, False, False, None))
@@ -2341,6 +2551,20 @@ def generate_drawing(step_path, matches, output_pdf_path, tol_fn=None, feature_s
 
     c.save()
     return output_pdf_path
+
+
+def _draw_one(job):
+    """Draw one part (runs in a worker process, or in the caller when there is no pool).
+    Returns (pdf path, error text or None)."""
+    step_path, matches, output_pdf, tol_args, feature_settings, length_unit = job
+    try:
+        if length_unit:
+            units.set_units(length=length_unit)
+        tol_fn = tolerance_mod.make_tolerance_fn(*tol_args) if tol_args else None
+        generate_drawing(step_path, matches, output_pdf, tol_fn=tol_fn, feature_settings=feature_settings)
+        return output_pdf, None
+    except Exception as exc:
+        return output_pdf, f'{type(exc).__name__}: {exc}'
 
 
 def generate_all(test_dir, output_dir=None, progress=None, include_tolerances=True, length_unit=None):
@@ -2380,13 +2604,6 @@ def generate_all(test_dir, output_dir=None, progress=None, include_tolerances=Tr
     tolerance_config = tolerance_mod.load_tolerance_config(test_dir)
     has_tolerance_config = include_tolerances and os.path.exists(
         tolerance_mod.config_file(test_dir, 'tolerance_config.json'))
-    if has_tolerance_config:
-        try:
-            import fit_check
-            tolerance_config.body_gaps = fit_check.nearest_gap_per_body(test_dir)
-        except Exception as exc:
-            print(f'Could not measure gaps between parts ({exc}); using the largest tolerance.')
-
     import body_inclusion
     import feature_dimensions
 
@@ -2421,6 +2638,17 @@ def generate_all(test_dir, output_dir=None, progress=None, include_tolerances=Tr
             step_paths.append(step_path)
     fastener_names = skipped_names
 
+    # How close each drawn part sits to its neighbours sets its tolerance band. Only pairs that
+    # include a drawn part matter, and the result is cached until the STEP files change.
+    if has_tolerance_config:
+        try:
+            import fit_check
+            drawn = {os.path.splitext(os.path.basename(f))[0] for f in step_paths}
+            tolerance_config.body_gaps = fit_check.nearest_gap_per_body(
+                test_dir, progress=lambda f, m: report(0.01 + 0.01 * f, m), only_involving=drawn)
+        except Exception as exc:
+            print(f'Could not measure gaps between parts ({exc}); using the largest tolerance.')
+
     # Each part gets its own folder holding its drawing and a copy of its STEP
     # re-oriented so its dominant features run along the axes. Matching and
     # drawing both work from that rotated copy.
@@ -2451,13 +2679,12 @@ def generate_all(test_dir, output_dir=None, progress=None, include_tolerances=Tr
         tolerance_config=tolerance_config if has_tolerance_config else None,
     )
 
+    # Parts are independent, so their drawings are made side by side in worker processes.
+    jobs = []
     generated = []
     skipped = []
-    for index, step_path in enumerate(step_paths):
+    for step_path in step_paths:
         body_name = os.path.splitext(os.path.basename(step_path))[0]
-        report(0.30 + 0.70 * index / max(len(step_paths), 1), f'Drawing {body_name} ({index + 1}/{len(step_paths)})')
-
-        matches = match_results['per_body'][step_path]['matched']
         part_dir = os.path.join(output_dir, body_name)
         os.makedirs(part_dir, exist_ok=True)
         output_pdf = os.path.join(part_dir, f'{body_name}.pdf')
@@ -2469,20 +2696,36 @@ def generate_all(test_dir, output_dir=None, progress=None, include_tolerances=Tr
         # blank, useless PDF for it (which loading it doesn't itself error
         # on - the shape just has no faces), skip it with a clear warning
         # so it doesn't look like a legitimate empty part.
-        body = load_step(step_path)
-        if len(body.faces()) == 0:
+        if len(load_step(step_path).faces()) == 0:
             skipped.append(body_name)
             print(f'Skipped (no geometry in STEP file): {step_path}')
             continue
 
-        tol_fn = None
+        tol_args = None
         if has_tolerance_config:
-            material_entry = project_data.get('materials', {}).get(body_name)
-            tol_fn = tolerance_mod.make_tolerance_fn(material_entry, tolerance_config.for_body(body_name))
+            tol_args = (project_data.get('materials', {}).get(body_name), tolerance_config.for_body(body_name))
+        jobs.append((step_path, match_results['per_body'][step_path]['matched'], output_pdf, tol_args,
+                     feature_settings, units.current('length')))
 
-        generate_drawing(step_path, matches, output_pdf, tol_fn=tol_fn, feature_settings=feature_settings)
-        generated.append(output_pdf)
-        print(f'Generated: {output_pdf}')
+    pool = None
+    if len(jobs) > 1:
+        try:
+            import fit_check
+            pool = fit_check._make_pool(max(1, min((os.cpu_count() or 2) - 2, 8, len(jobs))))
+        except Exception:
+            pool = None
+    try:
+        results = pool.imap_unordered(_draw_one, jobs) if pool else map(_draw_one, jobs)
+        for done, (output_pdf, error) in enumerate(results, start=1):
+            report(0.30 + 0.70 * done / max(len(jobs), 1), f'Drawn {os.path.basename(output_pdf)} ({done}/{len(jobs)})')
+            if error:
+                raise RuntimeError(f'{os.path.basename(output_pdf)}: {error}')
+            generated.append(output_pdf)
+            print(f'Generated: {output_pdf}')
+    finally:
+        if pool:
+            pool.terminate()
+    generated.sort()
 
     report(1.0, 'Done')
     if skipped:
