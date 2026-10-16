@@ -25,6 +25,7 @@ import glob
 import itertools
 import json
 import math
+import multiprocessing
 import os
 
 from OCP.BRepExtrema import BRepExtrema_DistShapeShape
@@ -53,7 +54,106 @@ def _bounding_boxes_within(bb_a, bb_b, max_gap_mm):
     )
 
 
-def find_nearest_gaps(project_dir, max_gap_mm=DEFAULT_MAX_GAP_MM):
+class _Box:
+    """A body's bounding box as plain numbers (so it can come back from a worker process)."""
+    def __init__(self, values):
+        self.xmin, self.xmax, self.ymin, self.ymax, self.zmin, self.zmax = values
+
+
+# ---- worker processes: each loads a STEP file at most once and keeps the shape ----
+_WORKER_SHAPES = {}
+
+
+def _worker_init():
+    """Make a worker quit by itself when the process that started it has gone (a cancelled job is
+    killed outright, which would otherwise leave its workers running)."""
+    import threading
+    import time
+
+    def watch():
+        parent = multiprocessing.parent_process()
+        while parent is not None and parent.is_alive():
+            time.sleep(0.5)
+        os._exit(0)
+
+    threading.Thread(target=watch, daemon=True).start()
+
+
+def _worker_shape(path):
+    if path not in _WORKER_SHAPES:
+        _WORKER_SHAPES[path] = step_loader.load_step(path)
+    return _WORKER_SHAPES[path]
+
+
+def _worker_info(path):
+    """(face count, bounding box values) of one STEP file."""
+    body = _worker_shape(path)
+    if len(body.faces()) == 0:
+        return 0, None
+    bb = body.bounding_box
+    return len(body.faces()), (bb.xmin, bb.xmax, bb.ymin, bb.ymax, bb.zmin, bb.zmax)
+
+
+def _worker_pair(args):
+    """(distance, point on A, point on B) between two STEP files, or None when it is over the limit."""
+    path_a, path_b, max_gap_mm = args
+    ext = BRepExtrema_DistShapeShape(_worker_shape(path_a).shape.wrapped, _worker_shape(path_b).shape.wrapped)
+    if not ext.IsDone() or ext.NbSolution() == 0:
+        return None
+    distance = ext.Value()
+    if distance > max_gap_mm:
+        return None
+    p1, p2 = ext.PointOnShape1(1), ext.PointOnShape2(1)
+    return distance, (p1.X(), p1.Y(), p1.Z()), (p2.X(), p2.Y(), p2.Z())
+
+
+def _make_pool(workers):
+    """A pool of worker processes. The caller may itself be a background job process (those are
+    daemons, which may not have children), so that flag is lifted while the pool starts."""
+    ctx = multiprocessing.get_context('spawn')
+    me = multiprocessing.current_process()
+    config = getattr(me, '_config', None)
+    previous = config.get('daemon') if config is not None else None
+    if config is not None and previous:
+        config['daemon'] = False
+    try:
+        return ctx.Pool(workers, initializer=_worker_init)
+    finally:
+        if config is not None and previous:
+            config['daemon'] = previous
+
+
+# ---- results are kept on disk, keyed on the STEP files, so a repeat run needs no measuring ----
+def _cache_key(step_paths, max_gap_mm, only_involving):
+    return {
+        'version': 2, 'max_gap_mm': max_gap_mm,
+        'only': sorted(only_involving) if only_involving else None,
+        'files': [[os.path.basename(f), os.path.getsize(f), int(os.path.getmtime(f))] for f in step_paths],
+    }
+
+
+def _read_cache(project_dir, key):
+    try:
+        with open(tolerance_mod.config_file(project_dir, 'gap_cache.json'), encoding='utf-8') as f:
+            data = json.load(f)
+        if data.get('key') != key:
+            return None
+        return [{**g, 'point_a': tuple(g['point_a']), 'point_b': tuple(g['point_b']),
+                 'center_a': tuple(g['center_a']), 'center_b': tuple(g['center_b'])} for g in data['gaps']]
+    except Exception:
+        return None
+
+
+def _write_cache(project_dir, key, gaps):
+    try:
+        with open(tolerance_mod.config_file(project_dir, 'gap_cache.json', for_write=True), 'w',
+                  encoding='utf-8') as f:
+            json.dump({'key': key, 'gaps': gaps}, f)
+    except Exception:
+        pass
+
+
+def find_nearest_gaps(project_dir, max_gap_mm=DEFAULT_MAX_GAP_MM, progress=None, only_involving=None):
     """Every pair of DIFFERENT bodies whose true nearest-point distance is
     <= `max_gap_mm`, computed directly from their real geometry - not from
     any assumed feature-matching relationship. Each entry: {body_a, body_b,
@@ -62,42 +162,78 @@ def find_nearest_gaps(project_dir, max_gap_mm=DEFAULT_MAX_GAP_MM):
     coordinate system every exported STEP file preserves - see
     bodychain.py's own docstring) and center_a/b are each body's bounding-
     box center, used as a stand-in "expands from here" anchor.
+
+    `only_involving`, if given, is a set of body names: only pairs that include at least one of
+    them are measured (the others can't change anything the caller uses). The exact solves run in
+    parallel worker processes, and the result is cached on disk until a STEP file changes.
+    `progress(fraction, message)` is called as the work advances.
     """
-    bodies = []
-    for step_path in sorted(glob.glob(os.path.join(project_dir, '*.step'))):
-        body_name = os.path.splitext(os.path.basename(step_path))[0]
-        body = step_loader.load_step(step_path)
-        if len(body.faces()) == 0:
-            continue  # empty STEP file (referenced/unresolved component) - not a real body
-        bb = body.bounding_box
-        center = ((bb.xmin + bb.xmax) / 2, (bb.ymin + bb.ymax) / 2, (bb.zmin + bb.zmax) / 2)
-        bodies.append((body_name, body, bb, center))
+    def report(fraction, message):
+        if progress is not None:
+            progress(fraction, message)
+
+    step_paths = sorted(glob.glob(os.path.join(project_dir, '*.step')))
+    key = _cache_key(step_paths, max_gap_mm, only_involving)
+    cached = _read_cache(project_dir, key)
+    if cached is not None:
+        return cached
+
+    names = [os.path.splitext(os.path.basename(f))[0] for f in step_paths]
+    workers = max(1, min((os.cpu_count() or 2) - 2, 12))
+    pool = None
+    if workers > 1 and len(step_paths) > 3:
+        try:
+            pool = _make_pool(workers)
+        except Exception:
+            pool = None
+    try:
+        report(0.0, 'Reading the parts...')
+        infos = pool.map(_worker_info, step_paths) if pool else [_worker_info(f) for f in step_paths]
+        bodies = []
+        for name, path, (faces, box) in zip(names, step_paths, infos):
+            if faces == 0:
+                continue  # empty STEP file (referenced/unresolved component) - not a real body
+            bb = _Box(box)
+            center = ((bb.xmin + bb.xmax) / 2, (bb.ymin + bb.ymax) / 2, (bb.zmin + bb.zmax) / 2)
+            bodies.append((name, path, bb, center))
+
+        pairs = []
+        for first, second in itertools.combinations(bodies, 2):
+            if only_involving and first[0] not in only_involving and second[0] not in only_involving:
+                continue
+            if _bounding_boxes_within(first[2], second[2], max_gap_mm):
+                pairs.append((first, second))
+
+        jobs = [(a[1], b[1], max_gap_mm) for a, b in pairs]
+        results = []
+        if pool:
+            for index, result in enumerate(pool.imap(_worker_pair, jobs, chunksize=1), start=1):
+                results.append(result)
+                report(0.1 + 0.9 * index / max(len(jobs), 1), f'Measuring gaps between parts ({index}/{len(jobs)})')
+        else:
+            for index, job in enumerate(jobs, start=1):
+                results.append(_worker_pair(job))
+                report(0.1 + 0.9 * index / max(len(jobs), 1), f'Measuring gaps between parts ({index}/{len(jobs)})')
+    finally:
+        if pool:
+            pool.terminate()
 
     gaps = []
-    for (name_a, body_a, bb_a, center_a), (name_b, body_b, bb_b, center_b) in itertools.combinations(bodies, 2):
-        if not _bounding_boxes_within(bb_a, bb_b, max_gap_mm):
+    for ((name_a, _pa, _ba, center_a), (name_b, _pb, _bb, center_b)), result in zip(pairs, results):
+        if result is None:
             continue
-        ext = BRepExtrema_DistShapeShape(body_a.shape.wrapped, body_b.shape.wrapped)
-        if not ext.IsDone() or ext.NbSolution() == 0:
-            continue
-        distance = ext.Value()
-        if distance > max_gap_mm:
-            continue
-        p1 = ext.PointOnShape1(1)
-        p2 = ext.PointOnShape2(1)
-        gaps.append({
-            'body_a': name_a, 'body_b': name_b, 'distance_mm': distance,
-            'point_a': (p1.X(), p1.Y(), p1.Z()), 'point_b': (p2.X(), p2.Y(), p2.Z()),
-            'center_a': center_a, 'center_b': center_b,
-        })
+        distance, point_a, point_b = result
+        gaps.append({'body_a': name_a, 'body_b': name_b, 'distance_mm': distance,
+                     'point_a': point_a, 'point_b': point_b, 'center_a': center_a, 'center_b': center_b})
+    _write_cache(project_dir, key, gaps)
     return gaps
 
 
-def nearest_gap_per_body(project_dir, max_gap_mm=DEFAULT_MAX_GAP_MM):
+def nearest_gap_per_body(project_dir, max_gap_mm=DEFAULT_MAX_GAP_MM, progress=None, only_involving=None):
     """{body_name: smallest nearest-point distance to any other body, or
     None if none is within max_gap_mm} - feeds the tolerance fit band."""
     out = {}
-    for g in find_nearest_gaps(project_dir, max_gap_mm):
+    for g in find_nearest_gaps(project_dir, max_gap_mm, progress, only_involving):
         for n in (g['body_a'], g['body_b']):
             if out.get(n) is None or g['distance_mm'] < out[n]:
                 out[n] = g['distance_mm']
